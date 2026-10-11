@@ -71,8 +71,8 @@ namespace NtCreateTokenFull
 
         public const int SecurityImpersonation = 2;
 
-        public const int TokenUser = 1;
-        public const int TokenGroups = 2;
+        // pproadv1 第二轮审查 [Q4]：删除未被引用的 TokenUser/TokenGroups 常量（死代码），
+        // 保留实际使用的 TokenPrivileges(3) 与 TokenSessionId(12)。
         public const int TokenPrivileges = 3;
         public const int TokenSessionId = 12;
     }
@@ -119,21 +119,13 @@ namespace NtCreateTokenFull
     [StructLayout(LayoutKind.Sequential)]
     struct LUID_AND_ATTRIBUTES { public LUID Luid; public uint Attributes; }
 
-    [StructLayout(LayoutKind.Sequential)]
-    struct TOKEN_PRIVILEGES
-    {
-        public uint PrivilegeCount;
-        // proadv 修复：显式 Pack=8，消除 LUID(4+4)+uint(4) 尾部填充导致 Marshal.SizeOf=16 的问题。
-        // 原 v15 代码以 SizeOf(TOKEN_PRIVILEGES)=16 作为 BufferLength 传给 AdjustTokenPrivileges，
-        // 但实际结构仅 12 字节；Windows 对 NewState 的解析只依赖 PrivilegeCount（1 => 12 字节），
-        // 因此行为不变，仅修正尺寸值。与 NativeMethods 内的 ADJUSTABLE_SINGLE_TOKEN_PRIVILEGES 等价。
-        [MarshalAs(UnmanagedType.Struct)]
-        public LUID_AND_ATTRIBUTES_PACKED Privileges;
-    }
-
-    [StructLayout(LayoutKind.Sequential, Pack = 8)]
-    struct LUID_AND_ATTRIBUTES_PACKED { public LUID Luid; public uint Attributes; }
-
+    // pproadv1 第二轮深度审查 [Q1]：原 proadv.cs/pproadv1 第一版中的
+    //   struct TOKEN_PRIVILEGES { uint; [MarshalAs(Struct)] LUID_AND_ATTRIBUTES_PACKED; }
+    // 在沙箱 dotnet build 中已无任何引用（死代码），且其 Pack=8 声明会使
+    // Marshal.SizeOf 返回 16（而非 Win32 TOKEN_PRIVILEGES 单特权布局的 12 字节），
+    // 一旦被复用会把错误的 BufferLength 传给 AdjustTokenPrivileges。
+    // 现删除该死结构，统一使用 NativeMethods.ADJUSTABLE_SINGLE_TOKEN_PRIVILEGES
+    // （Sequential 默认对齐 => 恰好 12 字节，与 Windows 解析方式一致）。
     [StructLayout(LayoutKind.Sequential)]
     struct TOKEN_PRIVILEGES_HEADER { public uint PrivilegeCount; }
 
@@ -403,6 +395,9 @@ namespace NtCreateTokenFull
             {
                 string arg = args.Length > 0 ? args[0].Trim() : "";
 
+                // pproadv1 第二轮审查 [Q5]：--phase2 必须保持为第一个分支（v15 原语义）。
+                // 上一版编辑误删了该分支，导致 Win10 Phase1 启动的子进程 "--phase2 ..."
+                // 会落入 "Unknown argument" 而使整个流程失效。现恢复。
                 if (string.Equals(arg, "--phase2", StringComparison.OrdinalIgnoreCase))
                 {
                     ExecutePhase2Logic(args);
@@ -410,6 +405,15 @@ namespace NtCreateTokenFull
                 else if (string.Equals(arg, "--grant-privileges", StringComparison.OrdinalIgnoreCase))
                 {
                     // proadv 新增（可选入口）：手动执行 LSA 授权流程
+                    // pproadv1 第二轮审查 [Q6]：原实现不校验管理员权限；GrantAndCheck 内部
+                    // LsaOpenPolicy(POLICY_ALL_ACCESS) 失败时只打印一句错误，用户难以定位根因。
+                    // 这里前置显式检查并给出清晰提示（与无参数分支的 IsAdministrator 门禁一致）。
+                    if (!IsAdministrator())
+                    {
+                        Console.WriteLine("[-] ERROR: --grant-privileges 需要以管理员身份运行（LsaOpenPolicy 需要策略写入权限）。");
+                        return;
+                    }
+
                     bool ok = PrivilegeGranter.GrantAndCheck(missingOnly: false);
                     // pproadv1 [P3]：非交互模式（-y/--yes）下授权成功后直接自动重启，
                     // 与交互式分支行为对齐；原实现授权后从不重启，需用户再手动操作。
@@ -539,12 +543,28 @@ namespace NtCreateTokenFull
         static int GetWindowsBuildNumber()
         {
             var osver = new OSVERSIONINFOEXW { dwOSVersionInfoSize = Marshal.SizeOf<OSVERSIONINFOEXW>() };
-            if (NativeMethods.RtlGetVersion(ref osver) == 0)
-                return (int)osver.dwBuildNumber;
+            // pproadv1 第二轮审查 [Q2]：必须同时校验返回值 == STATUS_SUCCESS(0)
+            // 且 dwOSVersionInfoSize 被回填为 sizeof(OSVERSIONINFOEXW)。
+            // 若结构体布局/尺寸与系统版本不匹配，RtlGetVersion 会返回
+            // STATUS_INVALID_INFO_CLASS 且不填充任何字段，此时 dwBuildNumber
+            // 保持默认值 0 —— 原实现会把 0 当作合法 build 号而误走 Win10 分支。
+            if (NativeMethods.RtlGetVersion(ref osver) == 0
+                && osver.dwOSVersionInfoSize == Marshal.SizeOf<OSVERSIONINFOEXW>()
+                && osver.dwBuildNumber > 0)
+                return osver.dwBuildNumber;
 
             // 回退：Environment.OSVersion（可能被 manifest 垫片降级）
-            try { return Environment.OSVersion.Version.Build; }
-            catch { return 0; }
+            try
+            {
+                int b = Environment.OSVersion.Version.Build;
+                if (b > 0) return b;
+            }
+            catch { /* ignore */ }
+
+            // pproadv1 [Q2]：两条路径都失败时不再静默返回 0（会被误判为 Win10），
+            // 而是明确报警，让调用方仍能按保守路径继续但用户知情。
+            Console.WriteLine("[!] WARNING: 无法可靠检测 Windows 版本号，按 Win10 及以下流程处理。");
+            return 0;
         }
 
         static void PauseIfInteractive()
