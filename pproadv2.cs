@@ -859,7 +859,7 @@ namespace NtCreateTokenFull
                         using (hSelf)
                         {
                             if (NativeMethods.DuplicateTokenEx(
-                                    hSelf, TokenConstants.MAXIMUM_ALLOWED, IntPtr.Zero,
+                                    hSelf.DangerousGetHandle(), TokenConstants.MAXIMUM_ALLOWED, IntPtr.Zero,
                                     TokenConstants.SecurityImpersonation,
                                     (int)TOKEN_TYPE.TokenPrimary, out var hLinked))
                             {
