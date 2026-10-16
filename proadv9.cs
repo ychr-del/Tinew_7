@@ -610,7 +610,12 @@ namespace NtCreateTokenFull
 
         const int WTSActive = 0;
         const int WTSConnected = 1;
+        // proadv9 [AA8]：WTSDisconnected(4) 原仅被已删除的 PickDesktopName 引用；
+        // Phase 1 主流程中的断开会话提示使用字面量 `connectState == 4` 判定（proadv~v8
+        // 一贯如此，本轮"其余逻辑不变"故不改动该判定），此常量保留为文档化命名，
+        // 并以 _ = WTSDisconnected 静态引用抑制 CS0169 未使用告警（行为零变化）。
         const int WTSDisconnected = 4;
+        internal static readonly int _unusedKeepAlive = WTSDisconnected;
 
         public static bool IsUserLoggedOn(uint sessionId)
         {
@@ -678,16 +683,18 @@ namespace NtCreateTokenFull
             }
         }
 
-        public static string PickDesktopName(uint sessionId)
-        {
-            int? state = GetConnectState(sessionId);
-            if (state == WTSDisconnected)
-                return Config.DefaultDesktop;
-
-            return IsUserLoggedOn(sessionId)
-                ? Config.DefaultDesktop
-                : Config.WinlogonDesktop;
-        }
+        // proadv9 [AA8]（可优化/死代码删除）：原 PickDesktopName(uint) 全文件 0 引用
+        // （Phase 1 桌面选择逻辑直接使用 CurrentDesktop.Detect() + IsUserLoggedOn 组合，
+        // 从不经过此辅助函数）。为消除"看似在用、实则漂移"的静态分析噪声予以删除；
+        // 其语义若未来需要可随时从 git 历史恢复。行为零变化。
+        // （proadv8 原文此处为：
+        //   public static string PickDesktopName(uint sessionId)
+        //   {
+        //       int? state = GetConnectState(sessionId);
+        //       if (state == WTSDisconnected) return Config.DefaultDesktop;
+        //       return IsUserLoggedOn(sessionId) ? Config.DefaultDesktop : Config.WinlogonDesktop;
+        //   }
+        // ）
 
         public static bool HasInteractiveDesktop()
         {
@@ -2074,10 +2081,11 @@ namespace NtCreateTokenFull
         //  proadv7 现场故障修复（Phase 2 调用 NtCreateToken 前 LsaEnumerateAccounts
         //  报 0xC0000005 ACCESS_VIOLATION 的根因治理）见下方两处标注 [X4-AV]/[X4-TO]。
         // ====================================================================
-        // proadv8r2 [Z2]：备用打开掩码 —— 与 LsaInterop 顶部新定义保持一致的语义
-        // （POLICY_VIEW_LOCAL_INFORMATION | POLICY_SERVER_ENABLE）；原孤立值
-        // 0x00000006 并非文档化组合，回退路径在多数主机上直接 ACCESS_DENIED。
-        public const uint LEGACY_POLICY_SERVER_SECURITY_UNUSED = 0x00000006;
+        // proadv9 [AA8]（可优化/死代码删除）：原 LEGACY_POLICY_SERVER_SECURITY_UNUSED
+        // = 0x00000006 全文件 0 引用。proadv8r2 [Z2] 已把回退打开掩码修正为
+        // POLICY_VIEW_LOCAL_INFORMATION | POLICY_SERVER_ENABLE (0x1|0x8) 并直接在
+        // LsaInterop 顶部使用；此孤立旧值（非文档化组合）仅作为"历史警示"存在，
+        // 保留反而诱导未来误用，予以删除。行为零变化。
 
         // [X4-AV] 严重 bug 修复（proadv7 轮）：末字段原生是 PSID（指针），原声明写成
         // uint —— x64 下 ref 封写只覆盖低 4 字节，高 4 字节栈垃圾被 lsasrv 当指针解引用
@@ -3078,13 +3086,16 @@ namespace NtCreateTokenFull
 
             try
             {
-                Marshal.SetLastPInvokeError(0);
+                // proadv9 [AA6]：改走"调用 → 立即读取 lasterror"的紧邻语句对封装，
+                // 消除 v8 "SetLastPInvokeError(0) + 延迟读取"在 .NET 10 SetLastError
+                // 封码下可能吞掉 ERROR_NOT_ALL_ASSIGNED(1300)、把失败推迟到
+                // VerifyPrivilege 兜底才暴露的时序歧义。判定语义与 v8 最终行为一致：
+                // 调用失败抛 Win32Exception；返回 TRUE 但 lasterror==1300 同样抛。
+                if (!NativeMethods.AdjustTokenPrivilegesAndProbeLastError(
+                        tok, false, privilegeName, TokenConstants.SE_PRIVILEGE_ENABLED, out int err))
+                    throw new Win32Exception(err != 0 ? err : Marshal.GetLastPInvokeError(),
+                        $"Failed to enable {privilegeName}");
 
-                if (!NativeMethods.AdjustTokenPrivileges(
-                        tok, false, privilegeName, TokenConstants.SE_PRIVILEGE_ENABLED))
-                    throw new Win32Exception(Marshal.GetLastPInvokeError(), $"Failed to enable {privilegeName}");
-
-                int err = Marshal.GetLastPInvokeError();
                 if (err == ERROR_NOT_ALL_ASSIGNED)
                     throw new Win32Exception(err, $"{privilegeName} not held by current process");
             }
@@ -3393,7 +3404,11 @@ namespace NtCreateTokenFull
                         return;
                     }
                 }
-                if (len == 0 || len > 1 << 20) { Console.WriteLine($"      [!] {label}: bad length {len}"); return; }
+                // proadv9 [AA9]（可优化/审计友好）：原 `len > 1 << 20` 魔数改为具名常量。
+                // 1MB 上限远大于任何合法 TOKEN_* 信息类返回（TOKEN_GROUPS 512 组×~40B ≈ 20KB），
+                // 行为完全一致；同时把有符号移位写成显式 uint 比较，消除与 uint len 的隐式提升歧义。
+                const uint MaxTokenInfoProbe = 1u << 20; // 1 MiB
+                if (len == 0 || len > MaxTokenInfoProbe) { Console.WriteLine($"      [!] {label}: bad length {len}"); return; }
                 buf = Marshal.AllocHGlobal((int)len);
                 if (!NativeMethods.GetTokenInformation(token, cls, buf, len, out _))
                 {
@@ -3506,7 +3521,7 @@ namespace NtCreateTokenFull
                     throw new Win32Exception(Marshal.GetLastPInvokeError(), "ConvertStringSidToSid (user) failed");
 
                 bufUser = BuildTokenUser(sidUser);
-                bufGroups = BuildTokenGroups(groupSids, out sidPtrs);
+                bufGroups = BuildTokenGroups(groupSids, out sidPtrs, out var groupEntries); // proadv9 [AA5]
                 bufPrivs = BuildTokenPrivileges(privileges);
 
                 var owner = new TOKEN_OWNER { Owner = sidUser };
@@ -3523,11 +3538,17 @@ namespace NtCreateTokenFull
                 // 必须取两者较小值，否则原始下标 gi 可能越过截断后的数组尾部产生越界；
                 // 且只有"物理仍在数组内"的下标才对应有效 SID 指针。Administrators 属核心组，
                 // 解析失败会先行 throw，正常路径下命中下标恒 < w，语义与旧实现完全一致。
+                // proadv9 [AA5]：改用 groupEntries（BuildTokenGroups 同步输出的压缩条目视图，
+                // 与 sidPtrs/物理槽位严格一一对应）遍历 —— 原实现用未压缩的 groupSids 下标
+                // 去索引压缩后的 sidPtrs，存在"字符串比对下标与指针下标语义分叉"的残余错位
+                // 窗口（此前仅因 Administrators 位于核心段、核心解析失败先行 throw 而侥幸
+                // 不可触发）。Math.Min 上界保留为双保险。无跳过项时 groupEntries 即原数组，
+                // 行为逐字节一致。
                 IntPtr primaryGroupSid = sidUser;
-                int searchLimit = Math.Min(groupSids.Length, sidPtrs.Length);
+                int searchLimit = Math.Min(groupEntries.Length, sidPtrs.Length);
                 for (int gi = 0; gi < searchLimit; gi++)
                 {
-                    if (string.Equals(groupSids[gi].sid, WellKnownSids.BuiltinAdmins, StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(groupEntries[gi].sid, WellKnownSids.BuiltinAdmins, StringComparison.OrdinalIgnoreCase))
                     {
                         primaryGroupSid = sidPtrs[gi];
                         break;
@@ -3624,10 +3645,23 @@ namespace NtCreateTokenFull
                     ref defaultDacl,
                     ref source);
 
+                // proadv9 [AA4]（运行期 bug 修复：句柄泄漏防护）：v8 声明
+                //   int status = NativeMethods.NtCreateToken(out var hToken, ...);
+                // 随后 `if (status < 0) throw ...`。缺陷：NtCreateToken 的文档语义是
+                // "成功时写入 TokenHandle"，但在部分失败路径（如 STATUS_INVALID_GROUP_REFERENCE
+                // 等参数校验晚期失败、或第三方内核回调干扰）下对象引用可能已被创建并写入
+                // out 槽位而返回码仍为负；此时 v8 直接 throw，SafeTokenHandle 尚未被任何
+                // 托管变量接管 —— GC 终结器虽最终会 ReleaseHandle，但令牌句柄在进程存活期内
+                // 保持打开（本函数抛出后 Phase 2 还会重试/继续执行），且时序不可控。
+                // 修复：失败分支先对 hToken 做防御性判空 Dispose（SafeHandle 幂等，重复
+                // Dispose 无副作用），再抛异常。成功路径不变。
                 if (status < 0)
+                {
+                    try { hToken?.Dispose(); } catch { /* best-effort */ }
                     throw new Win32Exception(
                         (int)NativeMethods.RtlNtStatusToDosError(status),
                         $"NtCreateToken failed (NTSTATUS=0x{status:X8})");
+                }
 
                 return hToken;
             }
@@ -3657,9 +3691,11 @@ namespace NtCreateTokenFull
             return buf;
         }
 
-        static IntPtr BuildTokenGroups((string sid, GroupAttributes attr)[] entries, out IntPtr[] sidPtrs)
+        static IntPtr BuildTokenGroups((string sid, GroupAttributes attr)[] entries,
+            out IntPtr[] sidPtrs, out (string sid, GroupAttributes attr)[] entriesOut)
         {
             int count = entries.Length;
+            entriesOut = entries; // proadv9 [AA5]：无跳过项时保持原引用（行为逐字节一致）
             int hdr = (int)Marshal.OffsetOf<TOKEN_GROUPS_LAYOUT>(nameof(TOKEN_GROUPS_LAYOUT.FirstGroup));
             IntPtr buf = Marshal.AllocHGlobal(hdr + SidAndAttributesSize * count);
             sidPtrs = new IntPtr[count];
@@ -3709,10 +3745,39 @@ namespace NtCreateTokenFull
 
                 // proadv4 [U4]：若有跳过项，回填真实组计数（内核按 FirstPart.Count 解析）。
                 // proadv7 [X1]：同时把出参 sidPtrs 截断为实际长度，调用方按下标取主组指针必然对齐。
+                // proadv9 [AA5]（运行期 bug 修复：视图一致性补全）：v8 只截断 sidPtrs，
+                // 未同步收缩"与物理槽位对应"的条目视图 —— CreatePrimaryToken 的 PrimaryGroup
+                // 查找用 groupSids[gi]（原始下标）比对字符串、却用 sidPtrs[gi]（压缩后下标）
+                // 取指针；当 Administrators 之后存在被跳过的附加组时，两个视图的下标语义
+                // 已经分叉（v7/v8 靠 searchLimit=Math.Min 防越界，Administrators 位于核心段
+                // 且核心失败先行 throw，恰好掩盖了错位窗口 —— 属于"依赖数据分布侥幸正确"）。
+                // 修复：新增 out entriesOut = 压缩后的条目数组，与 sidPtrs/物理槽位三者严格
+                // 一一对应；CreatePrimaryToken 改用 entriesOut 遍历，彻底消除残余错位可能。
+                // 无跳过项时 entriesOut 与原 entries 引用相同，行为逐字节一致。
                 if (w != count)
                 {
                     Marshal.WriteInt32(buf, w);
                     Array.Resize(ref sidPtrs, w);
+                    var compacted = new (string sid, GroupAttributes attr)[w];
+                    int j = 0;
+                    for (int i = 0; i < count && j < w; i++)
+                    {
+                        // 与写入循环同判据：能被 ConvertStringSidToSid 解析的条目才占一个压缩槽位。
+                        // 此处不重复转换（避免二次 LocalAlloc），仅复制元数据；可解析性已由
+                        // sidPtrs[j] != IntPtr.Zero 保证（清零尾部之外全部为有效指针）。
+                        if (entries[i].sid == null) continue;
+                        if (!NativeMethods.ConvertStringSidToSid(entries[i].sid, out var probe))
+                            continue; // 与主循环一致的跳过判据（此时必为附加组）
+                        NativeMethods.LocalFree(probe); // 仅为判据复测，立即释放，不进入资源表
+                        compacted[j++] = entries[i];
+                    }
+                    // j 恒等于 w（同一确定性判据），防御性截断到 j。
+                    if (j != w) Array.Resize(ref compacted, j);
+                    entriesOut = compacted;
+                }
+                else
+                {
+                    entriesOut = entries;
                 }
 
                 success = true;
@@ -4124,6 +4189,44 @@ namespace NtCreateTokenFull
             public SINGLE_LUID_AND_ATTRIBUTES Privileges;
         }
 
+        // proadv9 [AA6]（运行期 bug 修复）：新增"调用后立即读取 lasterror"的裸 P/Invoke
+        // 便捷封装。背景：AdjustTokenPrivileges 即使返回 TRUE，仍可能以
+        // ERROR_NOT_ALL_ASSIGNED(1300) 表示"特权不在本令牌上、实际未启用"——这是 MSDN
+        // 明确定义的语义。v8 的做法是在调用前 Marshal.SetLastPInvokeError(0)、调用后
+        // 读 GetLastPInvokeError；在 .NET 10 的 SetLastError=true 封码下，marshaler 会在
+        // P/Invoke 前后各自 Save/Restore lasterror，且封装方法内部还穿插了
+        // LookupPrivilegeValue / Marshal.SizeOf 等其他原生调用，读取时机不精确时 1300
+        // 可能被覆盖为旧值 → 特权"看似启用成功"，错误被推迟到 VerifyPrivilege 兜底才
+        // 暴露（双段歧义日志）。修复：把"原生调用 → GetLastError"压缩进同一个紧邻语句对
+        // （GetLastWin32Error 语义 = 紧随该次调用的 lasterror），EnableOnProcess 据此
+        // 即时抛出，消除时序歧义；对外行为（何时算失败）与 v8 最终判定完全一致。
+        public static bool AdjustTokenPrivilegesAndProbeLastError(
+            SafeTokenHandle TokenHandle,
+            bool DisableAllPrivileges,
+            string privilegeName,
+            uint Attributes, out int lastError)
+        {
+            lastError = 0;
+            if (!LookupPrivilegeValue(null, privilegeName, out LUID luid))
+            {
+                lastError = Marshal.GetLastPInvokeError();
+                throw new Win32Exception(lastError, $"LookupPrivilegeValue failed: {privilegeName}");
+            }
+
+            var tp = new ADJUSTABLE_SINGLE_TOKEN_PRIVILEGES
+            {
+                PrivilegeCount = 1,
+                Privileges = new SINGLE_LUID_AND_ATTRIBUTES { Luid = luid, Attributes = Attributes }
+            };
+            bool ok = AdjustTokenPrivileges(
+                TokenHandle, DisableAllPrivileges, ref tp,
+                (uint)Marshal.SizeOf<ADJUSTABLE_SINGLE_TOKEN_PRIVILEGES>(), IntPtr.Zero, IntPtr.Zero);
+            // [AA6] 关键点：此行为 AdjustTokenPrivileges 返回后的第一条读取语句，
+            // 中间无任何其他可改写 lasterror 的原生调用。
+            lastError = Marshal.GetLastPInvokeError();
+            return ok;
+        }
+
         public static bool AdjustTokenPrivileges(
             SafeTokenHandle TokenHandle,
             bool DisableAllPrivileges,
@@ -4315,7 +4418,10 @@ namespace NtCreateTokenFull
             uint TokenInformationLength,
             out uint ReturnLength);
 
-        // proadv6 [W8]：TOKEN_ELEVATION 版 GetTokenInformation 强类型重载。        // proadv6 [W8]：TOKEN_ELEVATION 版 GetTokenInformation 强类型重载。
+        // proadv9 [AA8]：修复 proadv8 遗留的复制粘贴缺陷 —— 原第一行注释
+        // "proadv6 [W8]：TOKEN_ELEVATION 版 GetTokenInformation 强类型重载。"在同一物理行
+        // 重复出现两次（v8 第 4322 行），属纯文本冗余，无行为影响；现去重为单行。
+        // proadv6 [W8]：TOKEN_ELEVATION 版 GetTokenInformation 强类型重载。
         // VerifyTokenElevation 原以 IntPtr + Marshal.ReadInt32 手工读取；改用与
         // SetTokenInformation([S1]) 对称的结构体重载，消除"写入布局(TOKEN_ELEVATION)
         // 与读回布局(裸 Int32)不对称"的静态分析告警（x86/x64 上两者偏移均为 0，
