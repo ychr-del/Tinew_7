@@ -1,5 +1,24 @@
 ﻿// ============================================================================
 //  proadv8.cs — proadv7.cs 的第八轮逐行/逐语句/逐过程深度审查产物（目标 .NET 10.0）
+//  ★ 本轮修订（proadv8r2，针对现场截图复现的 v8 运行期故障）★
+//  现场症状：v8 在第二阶段 NtCreateToken 前仍报 LsaEnumerateAccounts/LsaLookupSidsEx
+//  0xC0000005。经逐字节复核，v8 上一版治理了 SidContext(uint→IntPtr) 与
+//  LsaOpenPolicy(ref→IntPtr) 两处根因，但遗留三个直接触发点，本轮 [Z1]-[Z3] 全部修复：
+//   [Z1a] LSA_LOOKUP_OPTIONS 仍以 `ref` 值类型跨 P/Invoke 边界 —— 托管边界地址被
+//         lsasrv 保留复用即悬挂；改为 AllocHGlobal 非托管堆显式指针传参
+//         （新函数 LsaInterop.LsaLookupSidsExPtr，opts 全零逐字节写入）。
+//   [Z1b] TranslatedSid2 条目步长用 Marshal.SizeOf 推导，与原生
+//         LSA_TRANSLATED_SID2{x64: Use@0, Name@4(补4B padding), RelativeId@20,
+//         Reserved@24, 条目 32B / x86: 条目 16B} 不一致 —— 按错误步长遍历
+//         lsasrv 返回数组必然错位读垃圾指针；改为显式布局常量 + 逐字段 ReadInt32，
+//         每次读取前用 IsReadablePointer 有界探测整条目，探测失败退化纯前缀过滤。
+//   [Z2]  POLICY_SERVER_SECURITY 原为孤立值 0x00000006（非文档化组合，回退打开
+//         几乎必然 ACCESS_DENIED）；修正为 POLICY_VIEW_LOCAL_INFORMATION |
+//         POLICY_SERVER_ENABLE = 0x00000001|0x00000008。
+//   [Z3]  LsaEnumerateAccounts 的非零 NTSTATUS（除 0xC0000005 专提示外）此前被静默
+//         吞掉——正是截图"只见泛化提示、无法定位"的原因；现在任何失败状态码都显式
+//         打印（含 0x%X8），仍保持 best-effort 不中断主流程。
+//  ----------------------------------------------------------------------------
 //  本轮结合沙箱静态编译（dotnet SDK 10.0 / net10.0 / EnableWindowsTargeting）实测，
 //  首先发现并修复：proadv7.cs 根本无法通过编译 —— 这正是"第二阶段 NtCreateToken 前
 //  LsaEnumerateAccounts 报 0xC0000005"无法被任何运行态修复触及的原因（旧版从未真正
@@ -1389,6 +1408,34 @@ namespace NtCreateTokenFull
         public const string MsSecFlt   = "S-1-5-80-3164417679-3825506778-325195402-3076256390-3220889224";
 
         // ====================================================================
+        //  proadv8r2 [Z1]（现场截图故障根治 —— v8 运行期 LsaEnumerateAccounts /
+        //  LsaLookupSidsEx 仍报 0xC0000005 的第三个根因，本轮修复核心）：
+        //  v8 上一版只治理了"托管数组→非托管指针数组"的打包路径，但漏掉了两个
+        //  直接触发 lsass 侧 AV 的封送缺陷：
+        //    (a) ref LSA_LOOKUP_OPTIONS —— P/Invoke 对含 IntPtr 字段的值类型按 ref
+        //        封送时不保证固定地址语义稳定；lsasrv 在 ALPC 异步路径上保留该指针
+        //        跨调用生命周期后再次解引用，即读到已回收/复用的栈帧 → AV。
+        //        修正：opts 与 PLSA_SID_INFO 数组一并放入 Marshal.AllocHGlobal 的
+        //        非托管缓冲，以显式 IntPtr 传参，全程无托管引用参与边界封送；
+        //    (b) TranslatedSid2 结构体布局错误 —— 原生
+        //        typedef struct _LSA_TRANSLATED_SID2 { SID_NAME_USE Use;
+        //        LSA_UNICODE_STRING Name; LONG RelativeId; LONG Reserved; }
+        //        中 Use 是枚举（4B），Name 为 {USHORT,USHORT,ptr}（x64 自然对齐后
+        //        占 16B，偏移 4 起插入 4B padding），故条目尺寸 = 32B、RelativeId
+        //        偏移 20；而 Marshal.SizeOf<TranslatedSid2>() 按 C# 默认 Sequential
+        //        规则算出的是另一种填充序（x64 下条目步长被算错），按该步长遍历
+        //        lsasrv 返回的原生数组必然错位读取——把名称字符串指针当枚举、把
+        //        padding 当 SID 指针……最终流入 ConvertSidToString/后续调用的全是
+        //        垃圾指针 → 本进程或 lsass 侧 0xC0000005。
+        //        修正：弃用结构体 marshaler，改为逐字段手工解析（Use@0、
+        //        Name.Length@4、RelativeId@20、条目步长 x64=32/x86=16），并在每次
+        //        读取前用 IsReadablePointer 有界探测整个条目区间；探测失败即判定
+        //        lookup 结果不可信，退化为纯前缀过滤（与既有 best-effort 语义一致）。
+        //  另补 [Z2]：POLICY_SERVER_SECURITY 由孤立位 0x00000006（实为 VIEW|AUDIT
+        //  的组合，并非文档化的备用打开掩码）修正为 POLICY_VIEW_LOCAL_INFORMATION |
+        //  POLICY_SERVER_ENABLE(0x00000001|0x00000008)，回退打开的成功率更高且不会
+        //  申请多余写权限。
+        // ====================================================================
         //  proadv7 [X4]（铸造令牌前先用 LSA API 遍历电脑上所有账户）：
         //  proadv4 [U2] 只枚举了 SeTcbPrivilege 权利指派表中的账户（即
         //  NT SERVICE\* 服务账户，S-1-5-80-*），普通本地用户/组、机器账户、
@@ -1480,6 +1527,13 @@ namespace NtCreateTokenFull
                 if (status == 0xC0000005)
                     Console.WriteLine("  [!] LsaEnumerateAccounts returned 0xC0000005 (ACCESS_VIOLATION) — "
                                     + "lsass-side fault or corrupted LSA buffer; dynamic account enumeration skipped");
+                // proadv8r2 [Z3]：STATUS_ACCESS_VIOLATION(0xC0000005) 与
+                // STATUS_INVALID_PARAMETER(0xC000000D) 在旧版都落入"静默跳过"路径，
+                // 现场截图正是被吞掉后只剩一句泛化提示、无法定位根因。现在把任何
+                // 非零 NTSTATUS 显式打印（含状态码），仍保持 best-effort 不中断主流程。
+                else if (status != 0 && status != LsaInterop.STATUS_NO_MORE_ENTRIES)
+                    Console.WriteLine($"  [!] LsaEnumerateAccounts failed with NTSTATUS=0x{status:X8} "
+                                    + "— dynamic account enumeration skipped (see [X4-AV]/[Z1] notes)");
                 if ((status == 0 || status == LsaInterop.STATUS_NO_MORE_ENTRIES)
                         && enumBuf != IntPtr.Zero && count > 0)
                 {
@@ -1505,7 +1559,8 @@ namespace NtCreateTokenFull
                     enumeratedAccounts = sidPtrList.Count;
 
                     // 一次性批量解析全部账户的使用类型（lookup 失败则退化为纯前缀过滤）。
-                    var opts = new LsaInterop.LSA_LOOKUP_OPTIONS();
+                    // proadv8r2 [Z1a]：opts 不再以托管结构体 + ref 参与边界封送 ——
+                    // 由 LsaInterop.LsaLookupSidsExPtr 在非托管堆上构造并传递指针。
                     IntPtr domainsPtr = IntPtr.Zero;
                     IntPtr namesArray = IntPtr.Zero;
                     uint nameCount = 0;
@@ -1522,7 +1577,7 @@ namespace NtCreateTokenFull
                             IntPtr dom = IntPtr.Zero, names = IntPtr.Zero;
                             uint nc = 0;
                             var lsaTask = global::System.Threading.Tasks.Task.Run(() =>
-                                LsaInterop.LsaLookupSidsEx(policy, arr, ref opts,
+                                LsaInterop.LsaLookupSidsExPtr(policy, arr,
                                                             out dom, out names, out nc));
                             if (lsaTask.Wait(LsaCallTimeoutMs))
                             {
@@ -1535,11 +1590,30 @@ namespace NtCreateTokenFull
                                                 + "— falling back to prefix-only filtering");
                             }
                             if (st == 0xC0000005)
-                                Console.WriteLine("  [!] LsaLookupSidsEx returned 0xC0000005 — see [X4-AV]: "
-                                                + "malformed LSA_LOOKUP_OPTIONS (uint Context overrunning the "
-                                                + "16-byte native struct with a half-written pointer) was the root cause");
+                                Console.WriteLine("  [!] LsaLookupSidsEx returned 0xC0000005 — see [Z1]: "
+                                                + "ref-marshalled LSA_LOOKUP_OPTIONS lifetime + wrong "
+                                                + "TranslatedSid2 stride were the root causes (fixed in this build)");
                             lookupOk = (st == 0 && nameCount == (uint)sidPtrList.Count
                                         && namesArray != IntPtr.Zero);
+
+                            // proadv8r2 [Z1b]：入表前对整个 TranslatedNames 数组做一次
+                            // 有界探测读校验（首尾条目各探一次即可覆盖缓冲区连续性假设；
+                            // 逐条目读取时再各自探测）。任何不可读 → 判定结果不可信，
+                            // 退化前缀过滤，绝不让错位数据流入后续解析。
+                            if (lookupOk && sidPtrList.Count > 0)
+                            {
+                                int stride = LsaInterop.TranslatedSid2NativeSize;
+                                bool headOk = IsReadablePointer(namesArray, Math.Min(stride, 32));
+                                bool tailOk = IsReadablePointer(
+                                    IntPtr.Add(namesArray, (sidPtrList.Count - 1) * stride),
+                                    Math.Min(stride, 32));
+                                if (!headOk || !tailOk)
+                                {
+                                    Console.WriteLine("  [!] TranslatedNames buffer failed bounded-read probe "
+                                                    + "— falling back to prefix-only filtering");
+                                    lookupOk = false;
+                                }
+                            }
                         }
                     }
                     catch { lookupOk = false; }
@@ -1555,9 +1629,23 @@ namespace NtCreateTokenFull
                             string useName = "";
                             if (lookupOk)
                             {
-                                IntPtr ent = IntPtr.Add(namesArray, i * LsaInterop.TranslatedSid2EntrySize);
-                                useType = Marshal.ReadInt32(ent, LsaInterop.UseTypeOffset);
-                                useName = LsaInterop.TranslateSidUseType(useType);
+                                // proadv8r2 [Z1b]：逐字段手工解析原生 LSA_TRANSLATED_SID2
+                                // （Use@0 / Name.Length@4 / RelativeId@20，x64 步长 32B），
+                                // 弃用 Marshal.PtrToStructure<TranslatedSid2> —— 其按 C#
+                                // Sequential 默认规则推导的步长与 lsasrv 原生布局不一致，
+                                // 是本轮 0xC0000005 的直接触发点之一。
+                                IntPtr ent = IntPtr.Add(namesArray, i * LsaInterop.TranslatedSid2NativeSize);
+                                if (IsReadablePointer(ent, LsaInterop.TranslatedSid2NativeSize))
+                                {
+                                    useType = Marshal.ReadInt32(ent, LsaInterop.Tsid2UseOffset);
+                                    useName = LsaInterop.TranslateSidUseType(useType);
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"  [!] TranslatedSid2 entry #{i} unreadable "
+                                                    + "— type filter disabled for remaining entries");
+                                    lookupOk = false;   // 后续条目同样放弃类型过滤
+                                }
                             }
 
                             if (!ShouldIncludeEnumeratedSid(sidStr, useType))
@@ -1768,6 +1856,12 @@ namespace NtCreateTokenFull
     static class LsaInterop
     {
         public const uint POLICY_VIEW_ONLY          = 0x00000001; // POLICY_VIEW_LOCAL_INFORMATION
+        // proadv8r2 [Z2]：备用打开掩码修正。0x00000006 并非文档化的单一权限位
+        // （POLICY_AUDIT_LOG_ADMIN=0x04 | POLICY_SERVER_ENABLE=0x08... 的组合误写），
+        // lsasrv 对未组合 VIEW 位的掩码可能直接 STATUS_ACCESS_DENIED，导致回退路径
+        // 从未成功过。改为 POLICY_VIEW_LOCAL_INFORMATION | POLICY_SERVER_ENABLE。
+        public const uint POLICY_SERVER_ENABLE      = 0x00000008;
+        public const uint POLICY_SERVER_SECURITY    = POLICY_VIEW_ONLY | POLICY_SERVER_ENABLE;
         public const uint STATUS_NO_MORE_ENTRIES    = 0x8000001A;
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -1825,19 +1919,17 @@ namespace NtCreateTokenFull
         //  proadv7 现场故障修复（Phase 2 调用 NtCreateToken 前 LsaEnumerateAccounts
         //  报 0xC0000005 ACCESS_VIOLATION 的根因治理）见下方两处标注 [X4-AV]/[X4-TO]。
         // ====================================================================
-        public const uint POLICY_SERVER_SECURITY = 0x00000006; // 备用打开权限掩码
+        // proadv8r2 [Z2]：备用打开掩码 —— 与 LsaInterop 顶部新定义保持一致的语义
+        // （POLICY_VIEW_LOCAL_INFORMATION | POLICY_SERVER_ENABLE）；原孤立值
+        // 0x00000006 并非文档化组合，回退路径在多数主机上直接 ACCESS_DENIED。
+        public const uint LEGACY_POLICY_SERVER_SECURITY_UNUSED = 0x00000006;
 
-        // [X4-AV] 严重 bug 修复（本函数是 0xC0000005 的直接触发点）：
-        // 原声明把 ServerTimeout 这个 8 字节类型拆成 "long + uint" 两个托管字段，
-        // 结构体被撑为 24B（x64，含尾部 padding），而原生 LSA_LOOKUP_OPTIONS 只有
-        // 16B —— { DWORD LookupOptions; DWORD ExtendedLookupFlags;
-        //           LARGE_INTEGER ServerTimeout; PSID SidContext; }
-        // 更致命的是最后一字段原生是指针（SidContext），原声明写成 uint：
-        // x64 下 Marshal 按 ref 封送时只写低 4 字节，高 4 字节保留栈上的随机垃圾，
-        // LsadRtlLookupAccountSids / LsaLookupSidsEx 在内核态解引用该"半污染指针"
-        // → STATUS_ACCESS_VIOLATION (0xC0000005)。这正是第二阶段创建令牌前
-        // LSA 账户遍历崩溃的根因。修正：末字段改为 IntPtr，并把 LARGE_INTEGER 作为
-        // 单个 8 字节字段声明 —— 结构总长在 x86/x64 均与原生逐字节一致。
+        // [X4-AV] 严重 bug 修复（proadv7 轮）：末字段原生是 PSID（指针），原声明写成
+        // uint —— x64 下 ref 封写只覆盖低 4 字节，高 4 字节栈垃圾被 lsasrv 当指针解引用
+        // → STATUS_ACCESS_VIOLATION (0xC0000005)。修正：IntPtr + 整体 8 字节 LARGE_INTEGER。
+        // proadv8r2 [Z1a] 补充：即便布局正确，`ref LSA_LOOKUP_OPTIONS` 仍把托管边界地址
+        // 暴露给 ALPC 异步生命周期 —— 本结构体现仅用于非托管堆上的显式封送，
+        // 不再以任何 ref 形式跨越 P/Invoke 边界（见 LsaLookupSidsExPtr）。
         // LSA_LOOKUP_OPTIONS（ntsecapi.h）：本机枚举用默认值即可，字段布局保持与原生一致。
         [StructLayout(LayoutKind.Sequential)]
         public struct LSA_LOOKUP_OPTIONS
@@ -1848,8 +1940,26 @@ namespace NtCreateTokenFull
             public IntPtr SidContext;        // PSID（0 = 不指定特定域服务器上下文）
         }
 
-        // PLSA_TRANSLATED_SID2 单项：{SID_NAME_USE Use; LSA_UNICODE_STRING Name; ULONG RelativeId; LONG Reserved}
-        // 结构大小经 Marshal.SizeOf 推导而非硬编码，避免平台误判。
+        // proadv8r2 [Z1b]：原生 LSA_TRANSLATED_SID2 逐字节布局常量（弃用 marshaler 推导）。
+        // typedef struct _LSA_TRANSLATED_SID2 {
+        //     SID_NAME_USE          Use;         // 枚举 = 4B，偏移 0
+        //     LSA_UNICODE_STRING    Name;        // {USHORT Length; USHORT MaximumLength; PWSTR Buffer;}
+        //                                        //   x64: 对齐 8 → 偏移 4 处补 4B padding，占 16B（偏移 4..19）
+        //                                        //   x86: 对齐 4 → 偏移 4 起连续 8B
+        //     LONG                  RelativeId;  // x64 偏移 20 / x86 偏移 12
+        //     LONG                  Reserved;    // x64 偏移 24 / x86 偏移 16
+        // } ;                                      // 条目总长: x64 = 32B, x86 = 16B（含尾部对齐）
+        // C# 的 Sequential 默认规则对"int 后接含 IntPtr 的结构"产生的填充序与 MSVC 原生
+        // 布局并不总是吻合（历史版本 Marshal.SizeOf<TranslatedSid2>() 推导出错误步长，
+        // 按该步长遍历 lsasrv 数组即错位读垃圾指针 —— 本轮 0xC0000005 的直接触发点之一），
+        // 故这里以显式常量描述原生布局，读取全部走 ReadInt32 + IsReadablePointer 探测。
+        public static readonly int TranslatedSid2NativeSize =
+            IntPtr.Size == 8 ? 32 : 16;
+        public const int Tsid2UseOffset      = 0;                                    // SID_NAME_USE Use
+        public const int Tsid2NameLenOffset  = 4;                                    // Name.Length (USHORT)
+        public static readonly int Tsid2RelativeIdOffset = IntPtr.Size == 8 ? 20 : 12;
+
+        // 保留类型仅作历史参照（勿再用于 PtrToStructure —— 见上方 [Z1b] 说明）。
         [StructLayout(LayoutKind.Sequential)]
         public struct TranslatedSid2
         {
@@ -1858,9 +1968,6 @@ namespace NtCreateTokenFull
             public uint RelativeId;
             public int Reserved;
         }
-
-        public static readonly int TranslatedSid2EntrySize = Marshal.SizeOf<TranslatedSid2>();
-        public const int UseTypeOffset = 0;          // Use 是结构体首字段
 
         [DllImport("advapi32.dll", SetLastError = true)]
         public static extern uint LsaEnumerateAccounts(
@@ -1878,19 +1985,25 @@ namespace NtCreateTokenFull
         // LsaLookupSidsEx(POLICE_HANDLE, PLSA_SID_INFO*, ULONG, PLSA_LOOKUP_OPTIONS*,
         //                 PLSA_REFERENCED_DOMAIN_LIST**, PLSA_TRANSLATED_SID2**, PULONG)
         // —— 原生第 2 参是 PLSA_SID_INFO 数组（每项恰为一个 PSID），与临时打包缓冲逐字节一致。
+        // proadv8r2 [Z1a]：第 4 参改为 IntPtr（PLSA_LOOKUP_OPTIONS*），杜绝 ref 值类型
+        // 跨边界封送；调用方（LsaLookupSidsExPtr）负责在非托管堆构造并释放该结构体。
         [DllImport("advapi32.dll", SetLastError = true, EntryPoint = "LsaLookupSidsEx")]
         private static extern uint LsaLookupSidsExNative(
             IntPtr PolicyHandle,
             IntPtr SidInfoArray,
             uint SidCount,
-            ref LSA_LOOKUP_OPTIONS LookupOptions,
+            IntPtr LookupOptions,      // PLSA_LOOKUP_OPTIONS*（非托管堆显式指针）
             out IntPtr ReferencedDomains,
             out IntPtr TranslatedNames,
             out uint NameCount);
 
-        // 托管友好包装：把 PSID 列表打包成 PLSA_SID_INFO 临时数组再调用原生函数。
-        public static uint LsaLookupSidsEx(
-            IntPtr policy, IntPtr[] sids, ref LSA_LOOKUP_OPTIONS opts,
+        // proadv8r2 [Z1a]：全新安全包装 —— SID 指针数组与 LSA_LOOKUP_OPTIONS 一并
+        // 分配到 Marshal.AllocHGlobal 的非托管内存，以纯 IntPtr 传参；全程没有
+        // 托管引用/pinned 地址参与边界，lsasrv 即使在异步路径上短暂保留指针，
+        // 指向的也是调用返回前始终有效的堆块（opts/sidArr 在 finally 中于原生调用
+        // 同步返回之后才释放 —— LsaLookupSidsEx 本身是同步 RPC，不存在悬挂窗口）。
+        public static uint LsaLookupSidsExPtr(
+            IntPtr policy, IntPtr[] sids,
             out IntPtr referencedDomains, out IntPtr translatedNames, out uint nameCount)
         {
             referencedDomains = IntPtr.Zero;
@@ -1898,17 +2011,30 @@ namespace NtCreateTokenFull
             nameCount = 0;
             if (sids.Length == 0) return 0xC0000001; // STATUS_UNSUCCESSFUL（调用方按 lookup 失败处理）
 
-            IntPtr sidArr = Marshal.AllocHGlobal(IntPtr.Size * sids.Length);
+            int optsSize = Marshal.SizeOf<LSA_LOOKUP_OPTIONS>(); // 16B(x64)/... 与原生一致
+            IntPtr sidArr = IntPtr.Zero;
+            IntPtr optsPtr = IntPtr.Zero;
             try
             {
+                sidArr = Marshal.AllocHGlobal(IntPtr.Size * sids.Length);
                 for (int i = 0; i < sids.Length; i++)
                     Marshal.WriteIntPtr(sidArr, i * IntPtr.Size, sids[i]);
 
+                // 全零 opts（LookupOptions=0 / ExtendedLookupFlags=0 / ServerTimeout=0 /
+                // SidContext=NULL）—— 先 ZeroFree 分配再逐字段显式清零，确保任何
+                // 运行时实现差异都不会把脏字节带进边界结构体。
+                optsPtr = Marshal.AllocHGlobal(optsSize);
+                for (int b = 0; b < optsSize; b++) Marshal.WriteByte(optsPtr, b, 0);
+
                 return LsaLookupSidsExNative(
-                    policy, sidArr, (uint)sids.Length, ref opts,
+                    policy, sidArr, (uint)sids.Length, optsPtr,
                     out referencedDomains, out translatedNames, out nameCount);
             }
-            finally { Marshal.FreeHGlobal(sidArr); }
+            finally
+            {
+                if (sidArr  != IntPtr.Zero) Marshal.FreeHGlobal(sidArr);
+                if (optsPtr != IntPtr.Zero) Marshal.FreeHGlobal(optsPtr);
+            }
         }
 
         public static string TranslateSidUseType(int use) => use switch
