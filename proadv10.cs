@@ -2550,11 +2550,13 @@ namespace NtCreateTokenFull
             IntPtr loaPtr = Marshal.AllocHGlobal(Marshal.SizeOf<LSA_OBJECT_ATTRIBUTES>());
             try
             {
-                // proadv10 [AB5]（可优化/正确性）：改为 StructureToPtr(ref loa, ...) 显式
-                // 传引用 —— v9 传值时，若未来有人给 LSA_OBJECT_ATTRIBUTES 增加 string/数组
-                // 等托管引用字段，按值封送会触发"结构体含引用字段禁止按值 StructureToPtr"
-                // 的运行时 ArgumentException；当前全 IntPtr 布局下产物字节完全一致，行为零变化。
-                Marshal.StructureToPtr(ref loa, loaPtr, false);
+                // proadv10 [AB5]（编译错误修复 CS1615）：v10 曾尝试改为
+                // StructureToPtr(ref loa, ...) 显式传引用，但 Marshal.StructureToPtr
+                // 全部公开重载均为「按值」结构体参数（object 或 T where T:struct），
+                // 不存在 ref 重载，ref 传参直接导致 CS1615 无法编译。回退为按值封送：
+                // LSA_OBJECT_ATTRIBUTES 为全 IntPtr/int 布局（无托管引用字段），
+                // 按值封送产物字节与逐字段写入完全一致，行为零变化。
+                Marshal.StructureToPtr(loa, loaPtr, false);
                 status = LsaOpenPolicy(IntPtr.Zero, loaPtr, POLICY_ALL_ACCESS, out policyHandle);
             }
             finally { Marshal.FreeHGlobal(loaPtr); }
